@@ -13,6 +13,7 @@ A proxy server that lets you use Anthropic clients with Gemini or OpenAI models 
 
 - OpenAI API key 🔑
 - Google AI Studio (Gemini) API key (if using Google provider) 🔑
+- Azure OpenAI key (if using Azure provider) 🔑
 - [uv](https://github.com/astral-sh/uv) installed.
 
 ### Setup 🛠️
@@ -39,7 +40,8 @@ A proxy server that lets you use Anthropic clients with Gemini or OpenAI models 
    *   `ANTHROPIC_API_KEY`: (Optional) Needed only if proxying *to* Anthropic models.
    *   `OPENAI_API_KEY`: Your OpenAI API key (Required if using the default OpenAI preference or as fallback).
    *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if PREFERRED_PROVIDER=google).
-   *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default) or `google`. This determines the primary backend for mapping `haiku`/`sonnet`.
+   *   `AZURE_API_KEY`, `AZURE_API_BASE`, `AZURE_API_VERSION`, `AZURE_DEPLOYMENT`: Azure OpenAI settings (Required if PREFERRED_PROVIDER=azure or requesting provider="azure").
+   *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default), `google`, or `azure`. This determines the primary backend for mapping `haiku`/`sonnet`.
    *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`.
    *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`.
 
@@ -139,6 +141,48 @@ GEMINI_API_KEY="your-google-key"
 PREFERRED_PROVIDER="openai"
 BIG_MODEL="gpt-4o" # Example specific model
 SMALL_MODEL="gpt-4o-mini" # Example specific model
+```
+
+### Using Azure OpenAI via LiteLLM
+
+```dotenv
+# Required env
+AZURE_API_KEY="..."
+AZURE_API_BASE="https://<resource>.openai.azure.com/"
+AZURE_API_VERSION="2024-02-15-preview"
+AZURE_DEPLOYMENT="<your-deployment-name>"
+
+# Option A: prefer Azure by default
+PREFERRED_PROVIDER="azure"
+
+# Option B: override per request (if supported)
+# { "provider": "azure", "messages": [...], "stream": true }
+```
+
+Example cURL (non-stream):
+
+```bash
+curl -X POST http://localhost:8082/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "provider": "azure",
+    "model": "sonnet",
+    "messages": [{"role":"user","content":"Hello from Azure"}],
+    "stream": false
+  }'
+```
+
+Example cURL (stream):
+
+```bash
+curl -N -X POST http://localhost:8082/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "provider": "azure",
+    "model": "sonnet",
+    "messages": [{"role":"user","content":"Hello from Azure"}],
+    "stream": true
+  }'
 ```
 
 ## How It Works 🧩

@@ -82,8 +82,47 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Azure OpenAI environment variables (LiteLLM expects these names)
+if not os.environ.get("AZURE_API_KEY") and os.environ.get("AZURE_OPENAI_API_KEY"):
+    os.environ["AZURE_API_KEY"] = os.environ["AZURE_OPENAI_API_KEY"]
+if not os.environ.get("AZURE_API_BASE") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
+    os.environ["AZURE_API_BASE"] = os.environ["AZURE_OPENAI_ENDPOINT"]
+if not os.environ.get("AZURE_API_VERSION") and os.environ.get("AZURE_OPENAI_API_VERSION"):
+    os.environ["AZURE_API_VERSION"] = os.environ["AZURE_OPENAI_API_VERSION"]
+
+AZURE_API_KEY = os.environ.get("AZURE_API_KEY")
+AZURE_API_BASE = os.environ.get("AZURE_API_BASE")
+AZURE_API_VERSION = os.environ.get("AZURE_API_VERSION")
+AZURE_DEPLOYMENT = os.environ.get("AZURE_DEPLOYMENT")
+
+if PREFERRED_PROVIDER == "azure":
+    missing = [
+        name
+        for name, val in [
+            ("AZURE_API_KEY", AZURE_API_KEY),
+            ("AZURE_API_BASE", AZURE_API_BASE),
+            ("AZURE_API_VERSION", AZURE_API_VERSION),
+            ("AZURE_DEPLOYMENT", AZURE_DEPLOYMENT),
+        ]
+        if not val
+    ]
+    if missing:
+        logger.warning(
+            "Azure selected as preferred provider but missing configuration: %s",
+            ", ".join(missing),
+        )
+
 # Get preferred provider (default to openai)
 PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
+
+VALID_PROVIDERS = {"openai", "google", "azure"}
+
+def normalize_provider(value: Optional[str]) -> str:
+    """Normalize provider names and fallback to preferred provider."""
+    if not value:
+        return PREFERRED_PROVIDER
+    value = value.lower()
+    return value if value in VALID_PROVIDERS else PREFERRED_PROVIDER
 
 # Get model mapping configuration from environment
 # Default to latest OpenAI models if not set
@@ -186,13 +225,18 @@ class MessagesRequest(BaseModel):
     tool_choice: Optional[Dict[str, Any]] = None
     thinking: Optional[ThinkingConfig] = None
     original_model: Optional[str] = None  # Will store the original model name
+    provider: Optional[str] = None
     
     @field_validator('model')
     def validate_model_field(cls, v, info): # Renamed to avoid conflict
         original_model = v
-        new_model = v # Default to original value
+        new_model = v  # Default to original value
 
-        logger.debug(f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'")
+        provider_pref = normalize_provider(info.data.get('provider'))
+
+        logger.debug(
+            f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{provider_pref}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
+        )
 
         # Remove provider prefixes for easier matching
         clean_v = v
@@ -202,46 +246,54 @@ class MessagesRequest(BaseModel):
             clean_v = clean_v[7:]
         elif clean_v.startswith('gemini/'):
             clean_v = clean_v[7:]
+        elif clean_v.startswith('azure/'):
+            clean_v = clean_v[6:]
 
         # --- Mapping Logic --- START ---
         mapped = False
-        # Map Haiku to SMALL_MODEL based on provider preference
         if 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
+            if provider_pref == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
+            elif provider_pref == "azure":
+                deployment = os.environ.get("SMALL_MODEL") or AZURE_DEPLOYMENT
+                if deployment:
+                    new_model = f"azure/{deployment}"
+                    mapped = True
             else:
                 new_model = f"openai/{SMALL_MODEL}"
                 mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
         elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+            if provider_pref == "google" and BIG_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{BIG_MODEL}"
                 mapped = True
+            elif provider_pref == "azure":
+                deployment = os.environ.get("BIG_MODEL") or AZURE_DEPLOYMENT
+                if deployment:
+                    new_model = f"azure/{deployment}"
+                    mapped = True
             else:
                 new_model = f"openai/{BIG_MODEL}"
                 mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
         elif not mapped:
             if clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
                 new_model = f"gemini/{clean_v}"
-                mapped = True # Technically mapped to add prefix
+                mapped = True
             elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
                 new_model = f"openai/{clean_v}"
-                mapped = True # Technically mapped to add prefix
+                mapped = True
+            elif provider_pref == "azure" and not v.startswith('azure/'):
+                new_model = f"azure/{clean_v}"
+                mapped = True
         # --- Mapping Logic --- END ---
 
         if mapped:
             logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
         else:
-             # If no mapping occurred and no prefix exists, log warning or decide default
-             if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
-                 logger.warning(f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is.")
-             new_model = v # Ensure we return the original if no rule applied
+            if not v.startswith(('openai/', 'gemini/', 'anthropic/', 'azure/')):
+                logger.warning(f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is.")
+            new_model = v
 
-        # Store the original model in the values dictionary
         values = info.data
         if isinstance(values, dict):
             values['original_model'] = original_model
@@ -256,18 +308,20 @@ class TokenCountRequest(BaseModel):
     thinking: Optional[ThinkingConfig] = None
     tool_choice: Optional[Dict[str, Any]] = None
     original_model: Optional[str] = None  # Will store the original model name
+    provider: Optional[str] = None
     
     @field_validator('model')
     def validate_model_token_count(cls, v, info): # Renamed to avoid conflict
         # Use the same logic as MessagesRequest validator
-        # NOTE: Pydantic validators might not share state easily if not class methods
-        # Re-implementing the logic here for clarity, could be refactored
         original_model = v
-        new_model = v # Default to original value
+        new_model = v
 
-        logger.debug(f"📋 TOKEN COUNT VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'")
+        provider_pref = normalize_provider(info.data.get('provider'))
 
-        # Remove provider prefixes for easier matching
+        logger.debug(
+            f"📋 TOKEN COUNT VALIDATION: Original='{original_model}', Preferred='{provider_pref}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
+        )
+
         clean_v = v
         if clean_v.startswith('anthropic/'):
             clean_v = clean_v[10:]
@@ -275,45 +329,54 @@ class TokenCountRequest(BaseModel):
             clean_v = clean_v[7:]
         elif clean_v.startswith('gemini/'):
             clean_v = clean_v[7:]
+        elif clean_v.startswith('azure/'):
+            clean_v = clean_v[6:]
 
-        # --- Mapping Logic --- START ---
         mapped = False
-        # Map Haiku to SMALL_MODEL based on provider preference
         if 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
+            if provider_pref == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
+            elif provider_pref == "azure":
+                deployment = os.environ.get("SMALL_MODEL") or AZURE_DEPLOYMENT
+                if deployment:
+                    new_model = f"azure/{deployment}"
+                    mapped = True
             else:
                 new_model = f"openai/{SMALL_MODEL}"
                 mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
         elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+            if provider_pref == "google" and BIG_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{BIG_MODEL}"
                 mapped = True
+            elif provider_pref == "azure":
+                deployment = os.environ.get("BIG_MODEL") or AZURE_DEPLOYMENT
+                if deployment:
+                    new_model = f"azure/{deployment}"
+                    mapped = True
             else:
                 new_model = f"openai/{BIG_MODEL}"
                 mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
         elif not mapped:
             if clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
                 new_model = f"gemini/{clean_v}"
-                mapped = True # Technically mapped to add prefix
+                mapped = True
             elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
                 new_model = f"openai/{clean_v}"
-                mapped = True # Technically mapped to add prefix
-        # --- Mapping Logic --- END ---
+                mapped = True
+            elif provider_pref == "azure" and not v.startswith('azure/'):
+                new_model = f"azure/{clean_v}"
+                mapped = True
 
         if mapped:
             logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
         else:
-             if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
-                 logger.warning(f"⚠️ No prefix or mapping rule for token count model: '{original_model}'. Using as is.")
-             new_model = v # Ensure we return the original if no rule applied
+            if not v.startswith(('openai/', 'gemini/', 'anthropic/', 'azure/')):
+                logger.warning(
+                    f"⚠️ No prefix or mapping rule for token count model: '{original_model}'. Using as is."
+                )
+            new_model = v
 
-        # Store the original model in the values dictionary
         values = info.data
         if isinstance(values, dict):
             values['original_model'] = original_model
@@ -1076,14 +1139,18 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 @app.post("/v1/messages")
 async def create_message(
     request: MessagesRequest,
-    raw_request: Request
+    raw_request: Request,
+    provider: Optional[str] = None
 ):
     try:
         # print the body here
         body = await raw_request.body()
-    
+
         # Parse the raw body as JSON since it's bytes
         body_json = json.loads(body.decode('utf-8'))
+        if provider and 'provider' not in body_json:
+            body_json['provider'] = provider
+            request = MessagesRequest(**body_json)
         original_model = body_json.get("model", "unknown")
         
         # Get the display name for logging, just the model name without provider prefix
@@ -1110,6 +1177,26 @@ async def create_message(
         elif request.model.startswith("gemini/"):
             litellm_request["api_key"] = GEMINI_API_KEY
             logger.debug(f"Using Gemini API key for model: {request.model}")
+        elif request.model.startswith("azure/"):
+            if not all([AZURE_API_KEY, AZURE_API_BASE, AZURE_API_VERSION, AZURE_DEPLOYMENT]):
+                missing = [
+                    name
+                    for name, val in [
+                        ("AZURE_API_KEY", AZURE_API_KEY),
+                        ("AZURE_API_BASE", AZURE_API_BASE),
+                        ("AZURE_API_VERSION", AZURE_API_VERSION),
+                        ("AZURE_DEPLOYMENT", AZURE_DEPLOYMENT),
+                    ]
+                    if not val
+                ]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required Azure configuration: {', '.join(missing)}",
+                )
+            litellm_request["api_key"] = AZURE_API_KEY
+            litellm_request["api_base"] = AZURE_API_BASE
+            litellm_request["api_version"] = AZURE_API_VERSION
+            logger.debug(f"Using Azure API key for model: {request.model}")
         else:
             litellm_request["api_key"] = ANTHROPIC_API_KEY
             logger.debug(f"Using Anthropic API key for model: {request.model}")
@@ -1337,10 +1424,15 @@ async def create_message(
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(
     request: TokenCountRequest,
-    raw_request: Request
+    raw_request: Request,
+    provider: Optional[str] = None
 ):
     try:
         # Log the incoming token count request
+        if provider and not request.provider:
+            data = request.model_dump()
+            data['provider'] = provider
+            request = TokenCountRequest(**data)
         original_model = request.original_model or request.model
         
         # Get the display name for logging, just the model name without provider prefix

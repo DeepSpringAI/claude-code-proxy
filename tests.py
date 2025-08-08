@@ -16,16 +16,15 @@ Usage:
 import os
 import json
 import time
-import httpx
 import argparse
 import asyncio
 import sys
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+import unittest
+from unittest.mock import patch
+from fastapi.testclient import TestClient
+import importlib
 
 # Configuration
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -693,6 +692,106 @@ async def run_tests(args):
     else:
         print(f"\n⚠️ {total - passed} tests failed")
         return False
+
+
+class TestAzureProvider(unittest.TestCase):
+    def setUp(self):
+        env = {
+            "AZURE_API_KEY": "test-key",
+            "AZURE_API_BASE": "https://example.openai.azure.com/",
+            "AZURE_API_VERSION": "2024-02-15-preview",
+            "AZURE_DEPLOYMENT": "test-deploy",
+            "ANTHROPIC_API_KEY": "proxy-key",
+        }
+        self.env_patcher = patch.dict(os.environ, env, clear=True)
+        self.env_patcher.start()
+        import server as server_module
+        importlib.reload(server_module)
+        self.server = server_module
+        self.client = TestClient(self.server.app)
+        self.headers = {"x-api-key": "proxy-key", "anthropic-version": "2023-06-01"}
+
+    def tearDown(self):
+        self.env_patcher.stop()
+
+    @patch("litellm.completion")
+    def test_azure_litellm_request(self, mock_completion):
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        payload = {
+            "model": "sonnet",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "ping"}],
+            "provider": "azure",
+            "stream": False,
+        }
+        response = self.client.post("/v1/messages", json=payload, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        _, kwargs = mock_completion.call_args
+        self.assertEqual(kwargs["model"], "azure/test-deploy")
+        self.assertEqual(kwargs["api_base"], "https://example.openai.azure.com/")
+        self.assertEqual(kwargs["api_version"], "2024-02-15-preview")
+
+    @patch("litellm.acompletion")
+    def test_azure_streaming(self, mock_acompletion):
+        class Chunk:
+            def __init__(self, content='', finish=None, usage=False):
+                self.choices = [type('obj', (), {'delta': type('d', (), {'content': content}), 'finish_reason': finish})()]
+                self.usage = type('u', (), {'prompt_tokens':1, 'completion_tokens':1}) if usage else None
+
+        async def fake_stream():
+            yield Chunk('hi ')
+            yield Chunk('there', 'stop', usage=True)
+
+        mock_acompletion.return_value = fake_stream()
+
+        payload = {
+            "model": "sonnet",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "ping"}],
+            "provider": "azure",
+            "stream": True,
+        }
+        response = self.client.post("/v1/messages", json=payload, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        text = response.text
+        self.assertIn("event: message_start", text)
+        self.assertIn("event: message_stop", text)
+        self.assertIn("event: content_block_delta", text)
+
+    def test_missing_azure_env(self):
+        self.env_patcher.stop()
+        with patch.dict(
+            os.environ,
+            {
+                "AZURE_API_BASE": "https://example.openai.azure.com/",
+                "AZURE_API_VERSION": "2024-02-15-preview",
+                "AZURE_DEPLOYMENT": "test-deploy",
+                "ANTHROPIC_API_KEY": "proxy-key",
+            },
+            clear=True,
+        ):
+            import server as srv
+            importlib.reload(srv)
+            client = TestClient(srv.app)
+            payload = {
+                "model": "sonnet",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "ping"}],
+                "provider": "azure",
+                "stream": False,
+            }
+            resp = client.post(
+                "/v1/messages",
+                json=payload,
+                headers={"x-api-key": "proxy-key", "anthropic-version": "2023-06-01"},
+            )
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("AZURE_API_KEY", resp.json()["detail"])
+        self.env_patcher.start()
+
 
 async def main():
     # Check that API key is set
